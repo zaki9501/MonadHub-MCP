@@ -1,4 +1,7 @@
-# Example Monad SSE-based MCP Server built using Next.js
+# MonadHub-MCP: Comprehensive Monad Network Tool Suite
+
+## Overview
+A comprehensive MCP (Message Control Protocol) server for the Monad network, providing tools for NFT creation, token trading, price predictions, and more.
 
 ## How to add new tools
 
@@ -31,7 +34,7 @@ Paste the following in the `mcp.json` file
 {
   "mcpServers": {
     ...
-    "monad-mcp-sse": {
+    "monadhub-mcp": {
       "url": "[your_app_vercel_url]/sse"
     }
   }

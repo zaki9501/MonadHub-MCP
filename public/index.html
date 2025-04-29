@@ -1,10 +1,36 @@
-<h1>Monad SSE-based MCP using Next.js</h1>
-
-<p>Protocol is mounted below /.</p>
-
-<p>
-  <a
-    href="https://github.com/monad-developers/monad-sse-mcp"
-    >Check out the repo</a
-  >
-</p>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>NFT Image Upload</title>
+</head>
+<body>
+  <h1>Upload NFT Image to IPFS</h1>
+  <form id="uploadForm">
+    <input type="file" id="imageInput" name="image" accept="image/*" required />
+    <button type="submit">Upload</button>
+  </form>
+  <div id="result"></div>
+  <script>
+    document.getElementById('uploadForm').addEventListener('submit', async function(e) {
+      e.preventDefault();
+      const fileInput = document.getElementById('imageInput');
+      const file = fileInput.files[0];
+      if (!file) return;
+      const formData = new FormData();
+      formData.append('image', file);
+      const res = await fetch('/api/upload-image', {
+        method: 'POST',
+        body: formData
+      });
+      const data = await res.json();
+      const resultDiv = document.getElementById('result');
+      if (data.imageUrl) {
+        resultDiv.innerHTML = `<p>IPFS URL: <a href="${data.imageUrl}" target="_blank">${data.imageUrl}</a></p>`;
+      } else {
+        resultDiv.textContent = 'Upload failed: ' + (data.error || 'Unknown error');
+      }
+    });
+  </script>
+</body>
+</html>
