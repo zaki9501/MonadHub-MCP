@@ -1,13 +1,11 @@
 import { z } from "zod";
 import { initializeMcpApiHandler } from "../lib/mcp-api-handler";
-import { createPublicClient, formatUnits, http, parseEther } from "viem";
+import { createPublicClient, formatUnits, http, parseEther, getContractAddress, Hex, keccak256, toBytes, toHex, decodeEventLog } from "viem";
 import { monadTestnet } from "viem/chains";
 import axios from "axios";
 import { createWalletClient } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
+import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 import { uploadToPinata } from "@/lib/ipfs";
-import MonadNFT from "@/lib/MonadNFT.json";
-import MonadNFT1155 from "@/lib/MonadNFT1155.json";
 import NadFunAbi from "../lib/nadfun-abi.json";
 import { 
   createWalletClientFromPrivateKey, 
@@ -27,8 +25,6 @@ import { setContractAddress } from "../lib/redis";
 import multer from "multer";
 import { fileTypeFromBuffer } from "file-type";
 import path from "path";
-import { decodeEventLog } from "viem";
-import { createNFTCollection } from '@/lib/nft-collection';
 import { castoraAbi } from "../lib/castoraAbi";
 import FormData from 'form-data';
 
@@ -40,6 +36,9 @@ const publicClient = createPublicClient({
 
 // BlockVision API key from environment variables
 const BLOCKVISION_API_KEY = process.env.BLOCKVISION_API_KEY;
+
+// NFT Minter API endpoint
+const NFT_MINTER_API = "http://localhost:3002";
 
 // Add these interfaces at the top with other imports
 interface TokenResult {
@@ -132,44 +131,138 @@ const upload = multer({
 // Castora contract address
 const CASTORA_CONTRACT_ADDRESS = "0xa0742C672e713327b0D6A4BfF34bBb4cbb319C53";
 
-// Helper function to convert base64 image to buffer
-async function base64ToBuffer(base64String: string): Promise<Buffer> {
-  // Remove data URL prefix if present
-  const base64Data = base64String.replace(/^data:image\/\w+;base64,/, '');
-  return Buffer.from(base64Data, 'base64');
+// Helper function to convert base64 to buffer with type detection
+async function base64ToBuffer(base64String: string): Promise<{ buffer: Buffer; mimeType: string }> {
+  // Remove data URL prefix if present and extract mime type
+  const matches = base64String.match(/^data:([a-zA-Z0-9]+\/[a-zA-Z0-9-.+]+);base64,(.+)$/);
+  
+  if (matches) {
+    const mimeType = matches[1];
+    const base64Data = matches[2];
+    return {
+      buffer: Buffer.from(base64Data, 'base64'),
+      mimeType
+    };
+  }
+  
+  // If no mime type found in data URL, assume it's just base64
+  return {
+    buffer: Buffer.from(base64String, 'base64'),
+    mimeType: 'image/png' // Default to PNG
+  };
 }
 
-// Helper function to upload to Pinata
-async function uploadImageToPinata(imageBuffer: Buffer): Promise<string> {
+// Helper function to upload to Pinata with improved error handling
+async function uploadImageToPinata(imageData: Buffer | string, mimeType?: string): Promise<string> {
   // Verify we have API keys
   if (!process.env.PINATA_API_KEY || !process.env.PINATA_API_SECRET) {
     throw new Error('PINATA_API_KEY and PINATA_API_SECRET must be set in environment variables');
   }
 
-  console.log('Starting Pinata upload...');
-  const formData = new FormData();
-  formData.append('file', imageBuffer, {
-    filename: 'nft-image.png',
-    contentType: 'image/png',
-    knownLength: imageBuffer.length
-  });
+  console.log('Starting Pinata upload process...');
+  
+  let buffer: Buffer;
+  let detectedMimeType = mimeType;
 
+  // Handle different input types
+  if (typeof imageData === 'string' && (imageData.startsWith('/') || imageData.includes(':\\'))) {
+    // It's a file path
+    try {
+      const fs = await import('fs/promises');
+      console.log(`Reading file from path: ${imageData}`);
+      buffer = await fs.readFile(imageData);
+      console.log(`Successfully read file. Size: ${buffer.length} bytes`);
+      
+      if (!detectedMimeType) {
+        const fileType = await import('file-type');
+        const type = await fileType.fileTypeFromBuffer(buffer);
+        detectedMimeType = type?.mime || 'image/png';
+        console.log(`Detected MIME type: ${detectedMimeType}`);
+      }
+    } catch (error: any) {
+      throw new Error(`Failed to read file: ${error.message}`);
+    }
+  } else if (Buffer.isBuffer(imageData)) {
+    buffer = imageData;
+    console.log(`Received buffer data. Size: ${buffer.length} bytes`);
+    if (!detectedMimeType) {
+      try {
+        const fileType = await import('file-type');
+        const type = await fileType.fileTypeFromBuffer(buffer);
+        detectedMimeType = type?.mime || 'image/png';
+        console.log(`Detected MIME type: ${detectedMimeType}`);
+      } catch (error) {
+        console.warn('Could not detect mime type, defaulting to image/png');
+        detectedMimeType = 'image/png';
+      }
+    }
+  } else if (typeof imageData === 'string' && imageData.startsWith('data:')) {
+    // Handle base64 data URL
+    const matches = imageData.match(/^data:([a-zA-Z0-9]+\/[a-zA-Z0-9-.+]+);base64,(.+)$/);
+    if (matches) {
+      detectedMimeType = matches[1];
+      buffer = Buffer.from(matches[2], 'base64');
+      console.log(`Decoded base64 data URL. Size: ${buffer.length} bytes, MIME type: ${detectedMimeType}`);
+    } else {
+      throw new Error('Invalid data URL format');
+    }
+  } else if (typeof imageData === 'string') {
+    // Assume raw base64
+    try {
+      buffer = Buffer.from(imageData, 'base64');
+      console.log(`Decoded base64 string. Size: ${buffer.length} bytes`);
+      if (!detectedMimeType) {
+        const fileType = await import('file-type');
+        const type = await fileType.fileTypeFromBuffer(buffer);
+        detectedMimeType = type?.mime || 'image/png';
+        console.log(`Detected MIME type: ${detectedMimeType}`);
+      }
+    } catch (error) {
+      throw new Error('Invalid base64 string');
+    }
+  } else {
+    throw new Error('Invalid image data format');
+  }
+
+  // Validate buffer
+  if (!buffer || buffer.length === 0) {
+    throw new Error('Empty buffer received');
+  }
+
+  // Get file extension from mime type
+  const ext = detectedMimeType?.split('/')[1] || 'png';
+  
   try {
-    console.log('Uploading to Pinata with API key:', process.env.PINATA_API_KEY.substring(0, 4) + '...');
+    // Import form-data package
+    const FormData = (await import('form-data')).default;
+    const formData = new FormData();
+    
+    // Append the file buffer with proper filename and content type
+    formData.append('file', buffer, {
+      filename: `image.${ext}`,
+      contentType: detectedMimeType,
+      knownLength: buffer.length
+    });
+
+    console.log(`Uploading to Pinata... File size: ${buffer.length} bytes, MIME type: ${detectedMimeType}`);
     const response = await axios.post(
       'https://api.pinata.cloud/pinning/pinFileToIPFS',
       formData,
       {
-        maxContentLength: Infinity,
         maxBodyLength: Infinity,
         headers: {
           ...formData.getHeaders(),
           'pinata_api_key': process.env.PINATA_API_KEY,
-          'pinata_secret_api_key': process.env.PINATA_API_SECRET,
-          'Content-Type': `multipart/form-data; boundary=${formData.getBoundary()}`
-        }
+          'pinata_secret_api_key': process.env.PINATA_API_SECRET
+        },
+        timeout: 30000
       }
     );
+
+    if (!response.data?.IpfsHash) {
+      console.error('Pinata response:', response.data);
+      throw new Error('No IPFS hash in response');
+    }
 
     console.log('Pinata upload successful:', response.data);
     return `https://ipfs.io/ipfs/${response.data.IpfsHash}`;
@@ -180,12 +273,331 @@ async function uploadImageToPinata(imageBuffer: Buffer): Promise<string> {
       data: error.response?.data,
       headers: error.response?.headers
     });
+    
+    if (error.response?.status === 401) {
+      throw new Error('Invalid Pinata API credentials');
+    } else if (error.response?.status === 429) {
+      throw new Error('Pinata rate limit exceeded. Please try again later');
+    } else if (error.code === 'ECONNABORTED') {
+      throw new Error('Upload timed out. Please try again');
+    }
+    
     throw new Error(`Failed to upload to Pinata: ${error.response?.data?.message || error.message}`);
   }
 }
 
+// Snapshot tools configuration
+const CACHE_DURATION = parseInt(process.env.CACHE_DURATION || '300000');
+const RATE_LIMIT_REQUESTS = parseInt(process.env.RATE_LIMIT_REQUESTS || '100');
+const RATE_LIMIT_INTERVAL = parseInt(process.env.RATE_LIMIT_INTERVAL || '60000');
+
+// Cache implementation for snapshot tools
+const snapshotCache = new Map();
+
+// Rate limiting implementation for snapshot tools
+const snapshotRateLimit = {
+    requests: 0,
+    lastReset: Date.now(),
+    limit: RATE_LIMIT_REQUESTS,
+    interval: RATE_LIMIT_INTERVAL
+};
+
+// Helper function for caching snapshot data
+const getCachedSnapshotData = async (key: string, fetchFunction: () => Promise<any>) => {
+    if (snapshotCache.has(key)) {
+        const cachedItem = snapshotCache.get(key);
+        if (Date.now() - cachedItem.timestamp < CACHE_DURATION) {
+            return cachedItem.data;
+        }
+    }
+    const data = await fetchFunction();
+    snapshotCache.set(key, { data, timestamp: Date.now() });
+    return data;
+};
+
+// Rate limit checker for snapshot tools
+const checkSnapshotRateLimit = () => {
+    if (Date.now() - snapshotRateLimit.lastReset > snapshotRateLimit.interval) {
+        snapshotRateLimit.requests = 0;
+        snapshotRateLimit.lastReset = Date.now();
+    }
+    if (snapshotRateLimit.requests >= snapshotRateLimit.limit) {
+        throw new Error("Rate limit exceeded for snapshot tools");
+    }
+    snapshotRateLimit.requests++;
+};
+
+// Enhanced BlockVision API caller with retry logic for snapshots
+async function callBlockVisionAPIForSnapshot(endpoint: string, params: any = {}) {
+    checkSnapshotRateLimit();
+    const maxRetries = 3;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            const queryString = new URLSearchParams(params).toString();
+            const url = `https://api.blockvision.org/v2/monad/${endpoint}?${queryString}`;
+            
+            console.error(`[INFO] Calling BlockVision API for snapshot: ${url} (Attempt ${attempt}/${maxRetries})`);
+
+            const response = await fetch(url, {
+                headers: {
+                    'X-API-Key': BLOCKVISION_API_KEY!,
+                    'Content-Type': 'application/json'
+                }
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+
+            const data = await response.json();
+            if (data.code !== 0) {
+                throw new Error(`API Error: ${data.message}`);
+            }
+
+            return data.result;
+        } catch (error) {
+            if (attempt === maxRetries) throw error;
+            console.error(`[WARN] Attempt ${attempt} failed, retrying...`);
+            await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+        }
+    }
+}
+
+// Error handler for snapshot tools
+const handleSnapshotError = (error: Error, context: string) => {
+    console.error(`[ERROR] ${context}: ${error.message}`);
+    return {
+        content: [{
+            type: "text" as const,
+            text: `Error in ${context}: ${error.message}`
+        }],
+        isError: true,
+        _meta: {
+            errorCode: error instanceof Error ? 500 : 400,
+            context
+        }
+    };
+};
+
 export const mcpHandler = initializeMcpApiHandler(
   (server) => {
+    // Add ERC20 Snapshot Tool
+    server.tool(
+        "get-erc20-snapshot",
+        "Get enhanced ERC20 token holders snapshot with price and trading data",
+        {
+            contractAddress: z.string().describe("ERC20 token contract address"),
+            minBalance: z.number().optional().describe("Minimum token balance"),
+            maxBalance: z.number().optional().describe("Maximum token balance"),
+            holdingTime: z.number().optional().describe("Minimum holding time in days"),
+            includePriceData: z.boolean().optional().describe("Include price history"),
+            includeTrading: z.boolean().optional().describe("Include trading activity"),
+            includeMetadata: z.boolean().optional().describe("Include token metadata"),
+            random: z.boolean().optional().describe("Randomize results")
+        },
+        async ({ contractAddress, minBalance, maxBalance, holdingTime, includePriceData, includeTrading, includeMetadata, random }) => {
+            try {
+                // Get basic holder data with caching
+                const cacheKey = `erc20_${contractAddress}`;
+                const holders = await getCachedSnapshotData(cacheKey, () => 
+                    callBlockVisionAPIForSnapshot('token/holders', { 
+                        contractAddress,
+                        pageIndex: 1,
+                        pageSize: 50
+                    })
+                );
+
+                let snapshot = holders.data.map((holder: any) => ({
+                    address: holder.holder,
+                    balance: holder.amount,
+                    lastTransferTime: holder.lastTransferTime,
+                    percentage: holder.percentage,
+                    value: holder.usdValue
+                }));
+
+                // Apply filters
+                if (minBalance) {
+                    snapshot = snapshot.filter((holder: any) => holder.balance >= minBalance);
+                }
+                if (maxBalance) {
+                    snapshot = snapshot.filter((holder: any) => holder.balance <= maxBalance);
+                }
+                if (holdingTime) {
+                    const now = Date.now();
+                    const minHoldingTime = holdingTime * 24 * 60 * 60 * 1000;
+                    snapshot = snapshot.filter((holder: any) => {
+                        const lastTransfer = new Date(holder.lastTransferTime).getTime();
+                        return (now - lastTransfer) >= minHoldingTime;
+                    });
+                }
+
+                // Additional data collection
+                let additionalData: any = {};
+
+                if (includeMetadata) {
+                    additionalData.metadata = await getCachedSnapshotData(
+                        `metadata_${contractAddress}`,
+                        () => callBlockVisionAPIForSnapshot('token/metadata', { contractAddress })
+                    );
+                }
+
+                if (includePriceData) {
+                    additionalData.priceData = await getCachedSnapshotData(
+                        `price_${contractAddress}`,
+                        () => callBlockVisionAPIForSnapshot('token/price-history', { contractAddress })
+                    );
+                }
+
+                if (includeTrading) {
+                    additionalData.tradingHistory = await getCachedSnapshotData(
+                        `trading_${contractAddress}`,
+                        () => callBlockVisionAPIForSnapshot('token/trades', { contractAddress })
+                    );
+                }
+
+                // Randomize if requested
+                if (random) {
+                    snapshot = snapshot.sort(() => Math.random() - 0.5);
+                }
+
+                return {
+                    content: [{
+                        type: "text" as const,
+                        text: `Token Holder Snapshot (${snapshot.length} holders)\n\n` +
+                              snapshot.map((holder: any) => 
+                                `${holder.address}: ${holder.balance} (${holder.percentage}%)`
+                              ).join('\n')
+                    }],
+                    data: {
+                        holders: snapshot,
+                        ...additionalData
+                    },
+                    _meta: {
+                        timestamp: Date.now(),
+                        contractAddress,
+                        filters: {
+                            minBalance,
+                            maxBalance,
+                            holdingTime
+                        }
+                    }
+                };
+            } catch (error) {
+                return handleSnapshotError(error as Error, "ERC20 Snapshot");
+            }
+        }
+    );
+
+    // Add NFT Snapshot Tool
+    server.tool(
+        "get-nft-snapshot",
+        "Get enhanced NFT holders snapshot with rarity and floor price data",
+        {
+            contractAddress: z.string().describe("NFT contract address"),
+            minAmount: z.number().optional().describe("Minimum NFT amount"),
+            maxAmount: z.number().optional().describe("Maximum NFT amount"),
+            holdingTime: z.number().optional().describe("Minimum holding time in days"),
+            includeRarity: z.boolean().optional().describe("Include rarity data"),
+            includeFloorPrice: z.boolean().optional().describe("Include floor price tracking"),
+            includeTrading: z.boolean().optional().describe("Include trading history"),
+            random: z.boolean().optional().describe("Randomize results")
+        },
+        async ({ contractAddress, minAmount, maxAmount, holdingTime, includeRarity, includeFloorPrice, includeTrading, random }) => {
+            try {
+                // Get NFT holders with caching
+                const cacheKey = `nft_${contractAddress}`;
+                const result = await getCachedSnapshotData(cacheKey, () =>
+                    callBlockVisionAPIForSnapshot('collection/holders', { 
+                        contractAddress,
+                        pageIndex: '1',
+                        pageSize: '50'
+                    })
+                );
+
+                let snapshot = result.data.map((holder: any) => ({
+                    address: holder.ownerAddress,
+                    amount: holder.amount,
+                    uniqueTokens: holder.uniqueTokens,
+                    lastTransaction: holder.lastTransaction,
+                    percentage: holder.percentage,
+                    value: holder.value,
+                    isContract: holder.isContract
+                }));
+
+                // Apply filters
+                if (minAmount) {
+                    snapshot = snapshot.filter((holder: any) => holder.amount >= minAmount);
+                }
+                if (maxAmount) {
+                    snapshot = snapshot.filter((holder: any) => holder.amount <= maxAmount);
+                }
+                if (holdingTime) {
+                    const now = Date.now();
+                    const minHoldingTime = holdingTime * 24 * 60 * 60 * 1000;
+                    snapshot = snapshot.filter((holder: any) => {
+                        const lastTx = new Date(holder.lastTransaction).getTime();
+                        return (now - lastTx) >= minHoldingTime;
+                    });
+                }
+
+                // Additional data collection
+                let additionalData: any = {};
+
+                if (includeRarity) {
+                    additionalData.rarity = await getCachedSnapshotData(
+                        `rarity_${contractAddress}`,
+                        () => callBlockVisionAPIForSnapshot('collection/rarity', { contractAddress })
+                    );
+                }
+
+                if (includeFloorPrice) {
+                    additionalData.floorPrice = await getCachedSnapshotData(
+                        `floor_${contractAddress}`,
+                        () => callBlockVisionAPIForSnapshot('collection/floor-price', { contractAddress })
+                    );
+                }
+
+                if (includeTrading) {
+                    additionalData.tradingHistory = await getCachedSnapshotData(
+                        `nft_trading_${contractAddress}`,
+                        () => callBlockVisionAPIForSnapshot('collection/trades', { contractAddress })
+                    );
+                }
+
+                // Randomize if requested
+                if (random) {
+                    snapshot = snapshot.sort(() => Math.random() - 0.5);
+                }
+
+                return {
+                    content: [{
+                        type: "text" as const,
+                        text: `NFT Holder Snapshot (${snapshot.length} holders)\n\n` +
+                              snapshot.map((holder: any) => 
+                                `${holder.address}: ${holder.amount} NFTs (${holder.percentage}%)`
+                              ).join('\n')
+                    }],
+                    data: {
+                        holders: snapshot,
+                        ...additionalData
+                    },
+                    _meta: {
+                        timestamp: Date.now(),
+                        contractAddress,
+                        filters: {
+                            minAmount,
+                            maxAmount,
+                            holdingTime
+                        }
+                    }
+                };
+            } catch (error) {
+                return handleSnapshotError(error as Error, "NFT Snapshot");
+            }
+        }
+    );
+
     // Original tool: Get MON balance
     server.tool(
       "get-mon-balance",
@@ -1868,95 +2280,6 @@ export const mcpHandler = initializeMcpApiHandler(
       }
     );
 
-    // Create NFT Collection Tool
-    server.tool(
-      "create_nft_collection",
-      "Create an NFT collection on Monad testnet and mint the initial NFTs",
-      {
-        name: z.string().min(1).describe("Name of the NFT collection (e.g., 'The Pond')"),
-        symbol: z.string().min(1).describe("Symbol of the NFT collection (e.g., 'POND')"),
-        description: z.string().min(1).describe("Description of the NFT collection"),
-        artType: z.enum(["same", "unique"]).describe("NFT art type: 'same' (ERC-1155, same artwork) or 'unique' (ERC-721, unique artwork)"),
-        maxSupply: z.number().positive().int().describe("Maximum supply of NFTs in the collection"),
-        royaltyFee: z.number().min(0).max(100).describe("Royalty fee percentage for secondary sales (e.g., 5 for 5%)"),
-        recipientAddress: z.string().describe("Address to receive the minted NFTs"),
-        collectionImageUrl: z.string().describe("Base64 encoded image data or URL")
-      },
-      async ({ name, symbol, description, artType, maxSupply, royaltyFee, recipientAddress, collectionImageUrl }) => {
-        try {
-          console.log('Starting NFT collection creation process...');
-          
-          // Validate environment variables
-          if (!process.env.PINATA_API_KEY || !process.env.PINATA_API_SECRET) {
-            throw new Error('PINATA_API_KEY and PINATA_API_SECRET must be set in environment variables');
-          }
-
-          let imageUrl: string;
-          
-          // Convert base64 to buffer if it's base64 data
-          if (collectionImageUrl.startsWith('data:')) {
-            console.log('Converting base64 image to buffer...');
-            const buffer = await base64ToBuffer(collectionImageUrl);
-            
-            // Create a Blob from the buffer
-            const blob = new Blob([buffer], { type: 'image/png' });
-            
-            // Create a File object from the Blob
-            const file = new File([blob], 'nft-image.png', { type: 'image/png' });
-            
-            // Upload directly using the imported uploadToPinata function
-            console.log('Uploading to Pinata...');
-            const ipfsHash = await uploadToPinata(file);
-            imageUrl = `https://ipfs.io/ipfs/${ipfsHash}`;
-          } else if (collectionImageUrl.startsWith('http')) {
-            // If it's a URL, download it first
-            console.log('Downloading image from URL...');
-            const response = await axios.get(collectionImageUrl, { responseType: 'arraybuffer' });
-            const buffer = Buffer.from(response.data);
-            
-            // Create a Blob and File object
-            const blob = new Blob([buffer], { type: 'image/png' });
-            const file = new File([blob], 'nft-image.png', { type: 'image/png' });
-            
-            // Upload using uploadToPinata
-            console.log('Uploading to Pinata...');
-            const ipfsHash = await uploadToPinata(file);
-            imageUrl = `https://ipfs.io/ipfs/${ipfsHash}`;
-          } else {
-            throw new Error('Invalid image format. Please provide either a base64 encoded image or a URL');
-          }
-          
-          console.log('Image uploaded successfully:', imageUrl);
-          
-          // Create NFT collection with the IPFS URL
-          console.log('Creating NFT collection...');
-          const result = await createNFTCollection({
-            name,
-            image: imageUrl,
-            maxSupply,
-            recipientAddress,
-            description,
-            royaltyFee
-          });
-
-          return {
-            content: [{
-              type: "text",
-              text: `NFT Collection created successfully!\n\nCollection Details:\nName: ${name}\nSymbol: ${symbol}\nDescription: ${description}\nArt Type: ${artType}\nMax Supply: ${maxSupply}\nRoyalty Fee: ${royaltyFee}%\nRecipient: ${recipientAddress}\nImage URL: ${imageUrl}\n\nDeployment Result:\n${JSON.stringify(result, null, 2)}`
-            }]
-          };
-        } catch (error) {
-          console.error('NFT Collection creation error:', error);
-          return {
-            content: [{
-              type: "text",
-              text: `Failed to create NFT collection: ${error instanceof Error ? error.message : String(error)}`
-            }]
-          };
-        }
-      }
-    );
-
     // --- Castora Tools ---
     server.tool(
       "submit_price_prediction",
@@ -2312,9 +2635,10 @@ export const mcpHandler = initializeMcpApiHandler(
       "upload_to_pinata",
       "Upload an image directly to Pinata and get IPFS URL",
       {
-        imageData: z.string().describe("Base64 image data to upload")
+        imageData: z.string().describe("Base64 image data to upload or path to image file"),
+        mimeType: z.string().optional().describe("Optional MIME type of the image")
       },
-      async ({ imageData }) => {
+      async ({ imageData, mimeType }) => {
         try {
           console.log('Starting Pinata upload process...');
           
@@ -2323,13 +2647,37 @@ export const mcpHandler = initializeMcpApiHandler(
             throw new Error('PINATA_API_KEY and PINATA_API_SECRET must be set in environment variables');
           }
 
-          // Convert base64 to buffer
-          console.log('Converting image data to buffer...');
-          const buffer = await base64ToBuffer(imageData);
-          
+          // Validate input
+          if (!imageData) {
+            throw new Error('No image data provided');
+          }
+
+          let buffer: Buffer;
+
+          // Check if imageData is a file path
+          if (imageData.startsWith('/') || imageData.includes(':\\')) {
+            try {
+              const fs = await import('fs/promises');
+              buffer = await fs.readFile(imageData);
+            } catch (error: unknown) {
+              // Type check the error before accessing message property
+              const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+              throw new Error(`Failed to read image file: ${errorMessage}`);
+            }
+          } else {
+            // Treat as base64 or data URL
+            buffer = Buffer.from(imageData.replace(/^data:image\/\w+;base64,/, ''), 'base64');
+          }
+
+          // Validate buffer size (10MB limit)
+          const MAX_SIZE = 10 * 1024 * 1024; // 10MB
+          if (buffer.length > MAX_SIZE) {
+            throw new Error(`Image too large. Maximum size is ${MAX_SIZE / (1024 * 1024)}MB`);
+          }
+
           // Upload to Pinata
           console.log('Uploading to Pinata...');
-          const imageUrl = await uploadImageToPinata(buffer);
+          const imageUrl = await uploadImageToPinata(buffer, mimeType);
           
           console.log('Upload successful:', imageUrl);
           
@@ -2346,6 +2694,132 @@ export const mcpHandler = initializeMcpApiHandler(
               type: "text",
               text: `Failed to upload image: ${error instanceof Error ? error.message : String(error)}`
             }]
+          };
+        }
+      }
+    );
+
+    // New tool: Mint an NFT
+    server.tool(
+      "mint_nft",
+      "Mint an NFT on Monad Testnet using Magic Eden NFT Minter CLI",
+      {
+        contractAddress: z.string().describe("The NFT contract address to mint from"),
+        useContractPrice: z.boolean().optional().default(false).describe("Whether to fetch the price from the contract"),
+        manualPrice: z.string().optional().default("0").describe("Manual price in MON (e.g., '0' for free mint)"),
+        quantity: z.number().int().min(1).optional().default(1).describe("Number of NFTs to mint"),
+      },
+      async ({ contractAddress, useContractPrice, manualPrice, quantity }) => {
+        try {
+          const response = await axios.post(`${NFT_MINTER_API}/mint`, {
+            mode: "instant",
+            contractAddress,
+            useContractPrice,
+            manualPrice,
+            quantity,
+          });
+
+          const result = response.data;
+          if (!result.success) {
+            throw new Error(result.error || "Failed to mint NFT");
+          }
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: `NFT minted successfully!\nTransaction Hash: ${result.txHash}\nExplorer Link: ${result.explorerLink}\nMessage: ${result.message}`,
+              },
+            ],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Failed to mint NFT: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
+          };
+        }
+      }
+    );
+
+    // New tool: Track an NFT Transaction
+    server.tool(
+      "track_nft_transaction",
+      "Track a transaction from Magic Eden NFT Minter CLI on Monad Testnet",
+      {
+        transactionHash: z.string().describe("The transaction hash to track"),
+      },
+      async ({ transactionHash }) => {
+        try {
+          const response = await axios.post(`${NFT_MINTER_API}/track-transaction`, {
+            transactionHash,
+          });
+
+          const result = response.data;
+          if (!result.success) {
+            throw new Error(result.error || "Failed to track transaction");
+          }
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Transaction tracked successfully!\nTransaction Hash: ${result.details.transactionHash}\nStatus: ${result.details.status}\nBlock Number: ${result.details.blockNumber}\nGas Used: ${result.details.gasUsed}\nExplorer Link: ${result.details.explorerLink}\nTimestamp: ${result.details.timestamp}`,
+              },
+            ],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Failed to track transaction: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
+          };
+        }
+      }
+    );
+
+    // New tool: Get Tracked NFT Transactions
+    server.tool(
+      "get_tracked_nft_transactions",
+      "Retrieve all tracked transactions from Magic Eden NFT Minter CLI on Monad Testnet",
+      {},
+      async () => {
+        try {
+          const response = await axios.get(`${NFT_MINTER_API}/tracked-transactions`);
+          const result = response.data;
+
+          if (!result.success) {
+            throw new Error(result.error || "Failed to retrieve tracked transactions");
+          }
+
+          const transactionsText = result.transactions.length > 0
+            ? result.transactions.map((tx: any) =>
+                `Transaction Hash: ${tx.transactionHash}\nStatus: ${tx.status}\nBlock Number: ${tx.blockNumber}\nGas Used: ${tx.gasUsed}\nExplorer Link: ${tx.explorerLink}\nTimestamp: ${tx.timestamp}\n`
+              ).join("---------------------\n")
+            : "No tracked transactions found.";
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Tracked Transactions (${result.transactions.length}):\n${transactionsText}`,
+              },
+            ],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Failed to retrieve tracked transactions: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
           };
         }
       }
@@ -2373,16 +2847,13 @@ export const mcpHandler = initializeMcpApiHandler(
           description: "Retrieve transactions for a given Monad account address",
         },
         retrieve_account_internal_transactions: {
-          description:
-            "Retrieve internal transactions for a given Monad account address",
+          description: "Retrieve internal transactions for a given Monad account address",
         },
         retrieve_token_activities: {
-          description:
-            "Retrieve token activities for a given account and token address",
+          description: "Retrieve token activities for a given account and token address",
         },
         retrieve_collection_activities: {
-          description:
-            "Retrieve collection activities for a given account and collection address",
+          description: "Retrieve collection activities for a given account and collection address",
         },
         retrieve_token_holders: {
           description: "Retrieve token holders for a given contract address",
@@ -2391,15 +2862,13 @@ export const mcpHandler = initializeMcpApiHandler(
           description: "Retrieve native Monad token holders",
         },
         retrieve_collection_holders: {
-          description:
-            "Retrieve holders for a given collection contract address",
+          description: "Retrieve holders for a given collection contract address",
         },
         retrieve_contract_source_code: {
           description: "Retrieve source code for a given contract address",
         },
         retrieve_token_gating: {
-          description:
-            "Retrieve token gating information for an account and contract address",
+          description: "Retrieve token gating information for an account and contract address",
         },
         get_monorail_quote: {
           description: "Get a token swap quote from Monorail on Monad testnet"
@@ -2425,9 +2894,6 @@ export const mcpHandler = initializeMcpApiHandler(
         get_token_metadata: {
           description: "Retrieve detailed metadata for a specific token"
         },
-        create_nft_collection: {
-          description: "Create an NFT collection on Monad testnet and mint the initial NFTs"
-        },
         submit_price_prediction: {
           description: "Submit a price prediction to a Castora pool on Monad Testnet"
         },
@@ -2439,6 +2905,15 @@ export const mcpHandler = initializeMcpApiHandler(
         },
         upload_to_pinata: {
           description: "Upload an image directly to Pinata and get IPFS URL"
+        },
+        mint_nft: {
+          description: "Mint an NFT on Monad Testnet using Magic Eden NFT Minter CLI"
+        },
+        track_nft_transaction: {
+          description: "Track a transaction from Magic Eden NFT Minter CLI on Monad Testnet"
+        },
+        get_tracked_nft_transactions: {
+          description: "Retrieve all tracked transactions from Magic Eden NFT Minter CLI on Monad Testnet"
         }
       },
     },
