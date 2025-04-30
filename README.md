@@ -1,6 +1,6 @@
-# Monad Control Panel (MCP)
+# MonadHub (MCP)
 
-The Monad Control Panel is a comprehensive toolkit for interacting with various protocols and services on the Monad testnet. This toolkit provides easy access to BlockVisio, Castora, Monorail DEX, Nad.fun, and NFT functionalities.
+The Monad hub is a comprehensive toolkit for interacting with various protocols and services on the Monad testnet. This toolkit provides easy access to BlockVisio, Castora, Monorail DEX, Nad.fun, and NFT functionalities.
 
 ## Table of Contents
 - [Installation](#installation)
