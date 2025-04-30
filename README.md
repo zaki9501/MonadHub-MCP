@@ -84,7 +84,6 @@ npm install
 ### NFT Tools
 
 #### NFT Creation & Management
-- `create_nft_collection` - Create and mint NFT collections
 - `upload_to_pinata` - Upload images to IPFS via Pinata### Command Table
 
 The following table provides a quick reference for key MCP tools, their descriptions, and example commands to use them via the MCP interface.
