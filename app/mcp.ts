@@ -38,7 +38,7 @@ const publicClient = createPublicClient({
 const BLOCKVISION_API_KEY = process.env.BLOCKVISION_API_KEY;
 
 // NFT Minter API endpoint
-const NFT_MINTER_API = "http://localhost:3002";
+const NFT_MINTER_API = "https://piki-nodes-mint.piki-nodes.xyz";
 
 // Add these interfaces at the top with other imports
 interface TokenResult {
@@ -2699,7 +2699,7 @@ export const mcpHandler = initializeMcpApiHandler(
       }
     );
 
-    // New tool: Mint an NFT
+    // Mint NFT tool using Magic Eden API with private key from .env
     server.tool(
       "mint_nft",
       "Mint an NFT on Monad Testnet using Magic Eden NFT Minter CLI",
@@ -2711,12 +2711,42 @@ export const mcpHandler = initializeMcpApiHandler(
       },
       async ({ contractAddress, useContractPrice, manualPrice, quantity }) => {
         try {
-          const response = await axios.post(`${NFT_MINTER_API}/mint`, {
+          // Check for private key in .env
+          if (!process.env.PRIVATE_KEY) {
+            throw new Error("PRIVATE_KEY not set in environment variables");
+          }
+
+          // Try different minting methods
+          const mintMethods = [
+            { method: "mint", params: 0 },
+            { method: "mint", params: 1 },
+            { method: "mint", params: 2 },
+            { method: "mintPublic", params: 0 },
+            { method: "mintPublic", params: 1 },
+            { method: "mintPublic", params: 2 },
+            { method: "publicMint", params: 0 },
+            { method: "publicMint", params: 1 },
+            { method: "publicMint", params: 2 }
+          ];
+
+          interface MintResponse {
+            success: boolean;
+            error?: string;
+            txHash?: string;
+            explorerLink?: string;
+            message?: string;
+            mintMethod?: string;
+          }
+
+          const response = await axios.post<MintResponse>(`${NFT_MINTER_API}/mint`, {
             mode: "instant",
             contractAddress,
             useContractPrice,
             manualPrice,
             quantity,
+            privateKey: process.env.PRIVATE_KEY,
+            mintMethods: mintMethods,
+            debug: true
           });
 
           const result = response.data;
@@ -2728,16 +2758,30 @@ export const mcpHandler = initializeMcpApiHandler(
             content: [
               {
                 type: "text",
-                text: `NFT minted successfully!\nTransaction Hash: ${result.txHash}\nExplorer Link: ${result.explorerLink}\nMessage: ${result.message}`,
+                text: `NFT minted successfully!\nTransaction Hash: ${result.txHash}\nExplorer Link: ${result.explorerLink}\nMessage: ${result.message || ''}${result.mintMethod ? `\nMint Method Used: ${result.mintMethod}` : ''}`,
               },
             ],
           };
-        } catch (error) {
+        } catch (error: unknown) {
+          // Enhanced error handling with proper type checking
+          let errorMessage = "Unknown error occurred";
+          let debugInfo = "";
+
+          if (error instanceof Error) {
+            errorMessage = error.message;
+          }
+
+          if (axios.isAxiosError(error) && error.response?.data) {
+            const responseData = error.response.data as { error?: string; debug?: string };
+            errorMessage = responseData.error || errorMessage;
+            debugInfo = responseData.debug || '';
+          }
+
           return {
             content: [
               {
                 type: "text",
-                text: `Failed to mint NFT: ${error instanceof Error ? error.message : String(error)}`,
+                text: `Failed to mint NFT: ${errorMessage}${debugInfo ? `\nDebug Info: ${debugInfo}` : ''}`,
               },
             ],
           };
@@ -2907,7 +2951,7 @@ export const mcpHandler = initializeMcpApiHandler(
           description: "Upload an image directly to Pinata and get IPFS URL"
         },
         mint_nft: {
-          description: "Mint an NFT on Monad Testnet using Magic Eden NFT Minter CLI"
+          description: "Mint an NFT on Monad Testnet using private key from .env"
         },
         track_nft_transaction: {
           description: "Track a transaction from Magic Eden NFT Minter CLI on Monad Testnet"
