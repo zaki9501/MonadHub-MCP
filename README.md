@@ -1,12 +1,35 @@
 # Monad Control Panel (MCP)
 
-The Monad Control Panel (MCP) is your all-in-one toolkit for interacting with the Monad testnet ecosystem. Whether you're trading tokens, minting NFTs, participating in price predictions, or analyzing blockchain data, MCP provides simple and powerful tools to help you get started.
+The Monad Hub (MCP) is your all-in-one toolkit for interacting with the Monad testnet ecosystem. Whether you're trading tokens, minting NFTs, participating in price predictions, or analyzing blockchain data, MCP provides simple and powerful tools to help you get started.
 
 ## 🚀 Quick Start
 
+### Option 1: Automated Setup (Recommended)
+
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/MonadHub-MCP.git
+git clone https://github.com/zaki9501/MonadHub-MCP.git
+
+# Navigate to the project directory
+cd MonadHub-MCP
+
+# Run the setup script
+node setup.js
+```
+
+The setup script will:
+- Install all required dependencies
+- Guide you through configuration setup
+- Create necessary directories
+- Set up your environment variables
+
+### Option 2: Manual Setup
+
+If you prefer to set things up manually:
+
+```bash
+# Clone the repository
+git clone https://github.com/zaki9501/MonadHub-MCP.git
 
 # Navigate to the project directory
 cd MonadHub-MCP
@@ -14,14 +37,41 @@ cd MonadHub-MCP
 # Install dependencies
 npm install
 
-# Set up your environment variables
+# Create and configure your environment
 cp .env.example .env
-# Edit .env with your credentials:
-# - PRIVATE_KEY=your_wallet_private_key
-# - BLOCKVISION_API_KEY=your_blockvision_api_key
-# - PINATA_API_KEY=your_pinata_api_key
-# - PINATA_API_SECRET=your_pinata_secret
 ```
+
+Then edit `.env` with your credentials:
+```env
+# Required for transactions
+PRIVATE_KEY=your_wallet_private_key
+
+# Required for blockchain data
+BLOCKVISION_API_KEY=your_blockvision_api_key
+
+# Required for NFT operations
+PINATA_API_KEY=your_pinata_api_key
+PINATA_API_SECRET=your_pinata_secret
+```
+
+### Getting API Keys
+
+1. **BlockVision API Key**:
+   - Visit [BlockVision](https://blockvision.org/)
+   - Sign up for an account
+   - Navigate to API Keys section
+   - Create a new API key
+
+2. **Pinata API Key**:
+   - Go to [Pinata](https://www.pinata.cloud/)
+   - Create an account
+   - Navigate to API Keys
+   - Generate new key pair
+
+3. **Private Key** (⚠️ Use with caution):
+   - Export from your wallet
+   - Never share or commit this
+   - Use a testnet-only wallet for safety
 
 ## 📋 Table of Contents
 - [Features Overview](#features-overview)

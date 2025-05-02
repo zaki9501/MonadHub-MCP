@@ -1,12 +1,13 @@
 import { z } from "zod";
 import { initializeMcpApiHandler } from "../lib/mcp-api-handler";
-import { createPublicClient, formatUnits, http, parseEther, getContractAddress, Hex, keccak256, toBytes, toHex, decodeEventLog } from "viem";
+import { createPublicClient, formatUnits, http, parseEther, parseUnits, getContractAddress, Hex, keccak256, toBytes, toHex, decodeEventLog, type Abi } from "viem";
 import { monadTestnet } from "viem/chains";
 import axios from "axios";
 import { createWalletClient } from "viem";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 import { uploadToPinata } from "@/lib/ipfs";
 import NadFunAbi from "../lib/nadfun-abi.json";
+import https from "https";
 import { 
   createWalletClientFromPrivateKey, 
   createPublicRpcClient, 
@@ -27,6 +28,8 @@ import { fileTypeFromBuffer } from "file-type";
 import path from "path";
 import { castoraAbi } from "../lib/castoraAbi";
 import FormData from 'form-data';
+import OrdersAbi from "../lib/orders.json"; // ABI for Orders contract
+import Erc20Abi from "../lib/erc20.json"; // Generic ERC20 ABI
 
 // Create a public client to interact with the Monad testnet
 const publicClient = createPublicClient({
@@ -379,6 +382,81 @@ const handleSnapshotError = (error: Error, context: string) => {
         }
     };
 };
+
+// Add this helper function near the top
+function httpsGet(url: string, headers: Record<string, string>): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const options = {
+      headers: headers,
+      timeout: 10000 // 10 second timeout
+    };
+
+    const req = https.get(url, options, (res) => {
+      let data = '';
+
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
+
+      res.on('end', () => {
+        try {
+          const parsedData = JSON.parse(data);
+          resolve(parsedData);
+        } catch (e) {
+          reject(new Error('Failed to parse response'));
+        }
+      });
+    });
+
+    req.on('error', (error) => {
+      reject(error);
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Request timed out'));
+    });
+  });
+}
+
+// Contract addresses for Pingu trading
+const ORDERS_CONTRACT_ADDRESS = "0x3d7ec93875B6a6f0A5102fE29f887ee6E751b12F";
+const USDC_ADDRESS = "0xf817257fed379853cDe0fa4F97AB987181B1E5Ea"; // Remove extra 0x
+const NATIVE_TOKEN_ADDRESS = "0x0000000000000000000000000000000000000000"; // Native MON
+
+// Helper function to approve ERC20 tokens (e.g., USDC)
+async function approveToken(
+  walletClient: any,
+  publicClient: any,
+  tokenAddress: `0x${string}`,
+  spender: `0x${string}`,
+  amount: bigint
+) {
+  const currentAllowance = await publicClient.readContract({
+    address: tokenAddress,
+    abi: Erc20Abi as Abi,
+    functionName: "allowance",
+    args: [walletClient.account.address, spender],
+  }) as bigint;
+
+  if (currentAllowance < amount) {
+    const approveTxParams = {
+      account: walletClient.account,
+      address: tokenAddress,
+      abi: Erc20Abi as Abi,
+      functionName: "approve",
+      args: [spender, amount],
+    };
+
+    const gas = await publicClient.estimateGas(approveTxParams);
+    const approveTxHash = await walletClient.writeContract({
+      ...approveTxParams,
+      gas,
+    });
+
+    await publicClient.waitForTransactionReceipt({ hash: approveTxHash });
+  }
+}
 
 export const mcpHandler = initializeMcpApiHandler(
   (server) => {
@@ -2474,157 +2552,91 @@ export const mcpHandler = initializeMcpApiHandler(
       }
     );
 
-    // Keep list_castora_pools unchanged
+    // List Castora Pools
     server.tool(
       "list_castora_pools",
       "Fetch live prediction pools from Castora on Monad Testnet",
-      {},
+      {
+        random_string: z.string().describe("Dummy parameter for no-parameter tools"),
+      },
       async () => {
         try {
-          // Known token address to symbol mapping
-          const TOKEN_SYMBOLS: Record<string, string> = {
-            "0x0000000000000000000000000000000000000000": "MON",
-            "0xa0742C672e713327b0D6A4BfF34bBb4cbb319C53": "gMON",
-            // Add more as needed
-          };
-          // Known prediction token address to asset symbol mapping
-          const PREDICTION_TOKEN_SYMBOLS: Record<string, string> = {
-            "0x294C2647D9f3EacA43A364859c6E6a1E0E582DBD": "ETH",
-            "0x0ab0Dc55F747ADA00cC15D049CB654bbdc7d5AA6": "SOL",
-            "0xD31a59c85aE9D8edEFeC411D448f90841571b89c": "HYPE",
-            // Add more as needed
+          const contract = {
+            address: CASTORA_CONTRACT_ADDRESS as `0x${string}`,
+            abi: castoraAbi,
           };
 
-          function delay(ms: number) {
-            return new Promise(resolve => setTimeout(resolve, ms));
-          }
-
-          // This endpoint expects a GET request with the 'chain' header set to 'monadtestnet'
-          const response = await axios.get("https://server.castora.xyz/pools/live", {
-            headers: { chain: "monadtestnet" }
-          });
-          const poolsResponse = response.data;
-          const poolIds = poolsResponse.data;
-
-          if (!Array.isArray(poolIds) || poolIds.length === 0) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: "No live pools available at this time.",
-                },
-              ],
-            };
-          }
-
-          let rateLimitHit = false;
-          const poolDetailsList = [];
-          for (const poolId of poolIds) {
+          // Known live pool IDs from Castora API
+          const livePoolIds = [1719, 1720, 1721, 1722, 1709, 1710, 1711, 1712, 1729, 1730, 1731, 1732, 1723, 1724, 1725, 1726, 1733, 1734, 1735, 1736, 1737, 1738, 1739, 1740];
+          let openPools = [];
+          const now = Math.floor(Date.now() / 1000);
+          
+          for (const poolId of livePoolIds) {
             try {
-              const detailResp = await axios.get(`https://server.castora.xyz/pool/${poolId}`, {
-                headers: { chain: "monadtestnet" }
+              const result = await publicClient.readContract({
+                ...contract,
+                functionName: 'getPool',
+                args: [BigInt(poolId)]
               });
-              if (!detailResp.data.success || !detailResp.data.data) {
-                continue; // skip this pool
+
+              if (!result) continue;
+              
+              // Skip if pool is completed or window is closed
+              if (Number(result.completionTime) > 0 || Number(result.seeds.windowCloseTime) < now) {
+                continue;
               }
-              const pool = detailResp.data.data;
-              // Format time left
-              const now = Date.now();
-              const closesAt = Number(pool.seeds.snapshotTime) * 1000;
-              let timeLeft = closesAt - now;
-              if (timeLeft <= 0) {
-                continue; // Only include open pools
-              }
-              let timeLeftStr = "Closed";
-              if (timeLeft > 0) {
-                const hours = Math.floor(timeLeft / (1000 * 60 * 60));
-                const minutes = Math.floor((timeLeft % (1000 * 60 * 60)) / (1000 * 60));
-                const seconds = Math.floor((timeLeft % (1000 * 60)) / 1000);
-                timeLeftStr = `${hours}h : ${minutes}m : ${seconds}s`;
-              }
-              // Entry fee and token
-              const entryFee = pool.seeds.stakeAmount ? (Number(pool.seeds.stakeAmount) / 1e18).toFixed(2) : "-";
-              const entryFeeToken = TOKEN_SYMBOLS[pool.seeds.stakeToken] || pool.seeds.stakeToken;
-              // Asset pair
-              let pair = pool.assetPair;
-              if (!pair) {
-                // Try to resolve from asset or predictionToken
-                if (pool.asset) {
-                  pair = pool.asset;
-                } else if (pool.seeds.predictionToken) {
-                  const base = PREDICTION_TOKEN_SYMBOLS[pool.seeds.predictionToken] || pool.seeds.predictionToken;
-                  pair = `${base}/USD`;
-                } else {
-                  pair = "?";
-                }
-              }
-              // Duration
-              const duration = pool.duration || "24h";
-              // Predictions
-              const predictions = pool.noOfPredictions || 0;
-              // Status (always Open here)
-              const status = "Open";
-              poolDetailsList.push(
-                `Pool ID: ${poolId}\n` +
-                `${status}\n` +
-                `${duration}\n` +
-                `${pair}\n` +
-                `Pool Closes In\n${timeLeftStr}\n` +
-                `Predictions\n${predictions}\n` +
-                `Entry Fee\n${entryFee} ${entryFeeToken}\n`
-              );
-            } catch (err) {
-              const errorObj = err as any;
-              if (errorObj?.response?.data?.message === 'RPC Limit Reached') {
-                rateLimitHit = true;
-              }
-              console.error(`Error fetching details for pool ${poolId}:`, errorObj?.response?.data || errorObj?.message || errorObj);
-              // skip this pool
+
+              // Calculate total stake
+              const totalStake = Number(result.noOfPredictions) * Number(result.seeds.stakeAmount);
+              
+              openPools.push({
+                id: Number(result.poolId),
+                predictionToken: result.seeds.predictionToken,
+                stakeAmount: formatUnits(result.seeds.stakeAmount, 18),
+                snapshotTime: Number(result.seeds.snapshotTime),
+                windowCloseTime: Number(result.seeds.windowCloseTime),
+                totalPredictions: Number(result.noOfPredictions),
+                totalStake: formatUnits(BigInt(totalStake), 18)
+              });
+            } catch (error) {
+              console.error(`Error fetching pool ${poolId}:`, error);
+              continue;
             }
-            await delay(350); // 350ms delay between requests
           }
 
-          if (poolDetailsList.length === 0) {
+          // Sort pools by window close time (soonest first)
+          openPools.sort((a, b) => a.windowCloseTime - b.windowCloseTime);
+
+          if (openPools.length === 0) {
             return {
-              content: [
-                {
-                  type: "text",
-                  text: rateLimitHit ? "No live pools could be fetched due to RPC rate limiting. Please try again later." : "No live pools with details available at this time.",
-                },
-              ],
+              content: [{
+                type: "text",
+                text: "No open prediction pools found at the moment."
+              }]
             };
           }
-
-          let warning = rateLimitHit ? "\n⚠️ Not all pools could be fetched due to RPC rate limiting. Please try again later for a complete list.\n" : "";
 
           return {
-            content: [
-              {
-                type: "text",
-                text: poolDetailsList.join("\n---------------------\n") + warning,
-              },
-            ],
+            content: [{
+              type: "text",
+              text: `Found ${openPools.length} open pools:\n\n${openPools.map(pool => 
+                `Pool #${pool.id}:\n` +
+                `Entry Fee: ${pool.stakeAmount} MON\n` +
+                `Total Predictions: ${pool.totalPredictions}\n` +
+                `Total Staked: ${pool.totalStake} MON\n` +
+                `Window Closes: ${new Date(pool.windowCloseTime * 1000).toLocaleString()}\n` +
+                `Snapshot Time: ${new Date(pool.snapshotTime * 1000).toLocaleString()}\n` +
+                '-------------------'
+              ).join('\n')}`
+            }]
           };
         } catch (error) {
-          // Enhanced error logging for debugging 400 errors
-          if (axios.isAxiosError(error)) {
-            console.error("Castora pools API error:", {
-              url: error.config?.url,
-              method: error.config?.method,
-              data: error.config?.data,
-              status: error.response?.status,
-              response: error.response?.data,
-            });
-          }
+          console.error('Error fetching Castora pools:', error);
           return {
-            content: [
-              {
-                type: "text",
-                text: `Failed to fetch live pools: ${
-                  error instanceof Error ? error.message : String(error)
-                }`,
-              },
-            ],
+            content: [{
+              type: "text",
+              text: `Failed to fetch Castora pools: ${error instanceof Error ? error.message : String(error)}`
+            }]
           };
         }
       }
@@ -2868,6 +2880,161 @@ export const mcpHandler = initializeMcpApiHandler(
         }
       }
     );
+
+    // Add supported markets constant
+    const SUPPORTED_PINGU_MARKETS = [
+      "BTC-USD",
+      "ETH-USD",
+      "ARB-USD",
+      "LINK-USD",
+      "SOL-USD"
+    ] as const; // Make this a readonly tuple type
+
+    // Add Pingu fee constant
+    const PINGU_FEE_BPS = 7; // 0.07% fee in basis points
+
+    server.tool(
+      "trade_pingu_perpetuals",
+      "Trade perpetuals (long/short) on Pingu protocol (Monad testnet)",
+      {
+        pair: z.enum(SUPPORTED_PINGU_MARKETS).describe("Trading pair (e.g., 'BTC-USD', 'ETH-USD')"),
+        position: z.enum(["long", "short"]).describe("Position type (long or short)"),
+        marginAmount: z.string().describe("Margin amount in MON (e.g., '0.2')"),
+        sizeAmount: z.string().describe("Position size in MON (e.g., '1.0')"),
+        orderType: z.enum(["market", "limit"]).optional().default("market").describe("Order type (market or limit)"),
+        limitPrice: z.number().min(0).optional().default(0).describe("Limit price in USD (required for limit orders)"),
+        takeProfitPrice: z.number().min(0).optional().default(0).describe("Take-profit price in USD (optional)"),
+        stopLossPrice: z.number().min(0).optional().default(0).describe("Stop-loss price in USD (optional)"),
+      },
+      async ({
+        pair,
+        position,
+        marginAmount,
+        sizeAmount,
+        orderType = "market",
+        limitPrice = 0,
+        takeProfitPrice = 0,
+        stopLossPrice = 0,
+      }) => {
+        try {
+          // Validate inputs
+          if (!pair || !position || !marginAmount || !sizeAmount) {
+            throw new Error("pair, position, marginAmount, and sizeAmount are required");
+          }
+
+          // Validate market exists
+          if (!SUPPORTED_PINGU_MARKETS.includes(pair)) {
+            throw new Error(`Invalid market. Supported markets are: ${SUPPORTED_PINGU_MARKETS.join(", ")}`);
+          }
+
+          if (orderType === "limit" && limitPrice <= 0) {
+            throw new Error("limitPrice required for limit orders");
+          }
+
+          // Initialize wallet client
+          if (!process.env.PRIVATE_KEY) {
+            throw new Error("PRIVATE_KEY not set in environment");
+          }
+          const account = privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`);
+          const walletClient = createWalletClient({
+            account,
+            chain: monadTestnet,
+            transport: http(),
+          });
+
+          // Convert amounts to wei
+          const marginWei = parseEther(marginAmount);
+          const sizeWei = parseEther(sizeAmount);
+          
+          // Calculate trading fee (0.07%)
+          const tradingFeeWei = (sizeWei * BigInt(PINGU_FEE_BPS)) / BigInt(10000);
+          
+          // Calculate total required margin including fee
+          const totalMarginRequired = marginWei + tradingFeeWei;
+          
+          // Check balance against total required amount
+          const balance = await publicClient.getBalance({ address: account.address });
+          if (balance < totalMarginRequired) {
+            throw new Error(
+              `Insufficient MON balance. Required: ${formatUnits(marginWei, 18)} MON + ${formatUnits(tradingFeeWei, 18)} MON (fee), Available: ${formatUnits(balance, 18)} MON`
+            );
+          }
+
+          const timestamp = BigInt(Math.floor(Date.now() / 1000));
+
+          // Construct order parameters
+          const orderParams = {
+            orderId: BigInt(0), // New order
+            user: account.address,
+            asset: NATIVE_TOKEN_ADDRESS, // Native MON
+            market: pair,
+            margin: marginWei,
+            size: sizeWei,
+            price: BigInt(orderType === "limit" ? parseUnits(limitPrice.toString(), 6) : 0),
+            fee: tradingFeeWei, // Set the calculated fee
+            isLong: position === "long",
+            orderType: orderType === "market" ? 0 : 1,
+            isReduceOnly: false,
+            timestamp: BigInt(0),
+            expiry: BigInt(0),
+            cancelOrderId: BigInt(0)
+          };
+
+          // Convert take-profit and stop-loss to wei with 6 decimals (USD prices)
+          const tpPriceWei = takeProfitPrice > 0 ? parseUnits(takeProfitPrice.toString(), 6) : BigInt(0);
+          const slPriceWei = stopLossPrice > 0 ? parseUnits(stopLossPrice.toString(), 6) : BigInt(0);
+
+          // Prepare transaction
+          const txParams = {
+            account: walletClient.account,
+            address: ORDERS_CONTRACT_ADDRESS.toLowerCase() as `0x${string}`,
+            abi: (OrdersAbi.abi || OrdersAbi) as unknown as Abi,
+            functionName: "submitOrder",
+            args: [orderParams, tpPriceWei, slPriceWei],
+            value: totalMarginRequired, // Send total amount including fee
+            gas: BigInt(1000000),
+            maxFeePerGas: parseUnits("67.500000001", 9),
+            maxPriorityFeePerGas: parseUnits("0.000000001", 9)
+          };
+
+          // Submit order
+          const txHash = await walletClient.writeContract(txParams);
+
+          // Wait for transaction and verify OrderCreated event
+          const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
+          let orderId: string | undefined;
+          for (const log of receipt.logs) {
+            try {
+              const decoded = decodeEventLog({
+                abi: (OrdersAbi.abi || OrdersAbi) as unknown as Abi,
+                data: log.data,
+                topics: log.topics,
+              });
+              if (decoded.eventName === "OrderCreated") {
+                orderId = (decoded.args as any).orderId.toString();
+                break;
+              }
+            } catch (e) {
+              continue;
+            }
+          }
+
+          return {
+            content: [{
+              type: "text",
+              text: `Order submitted successfully!\nTransaction Hash: ${txHash}\nOrder ID: ${orderId || "Unknown"}\nPair: ${pair}\nPosition: ${position}\nMargin: ${marginAmount} MON\nTrading Fee: ${formatUnits(tradingFeeWei, 18)} MON\nSize: ${sizeAmount} MON${orderType === "limit" ? `\nLimit Price: ${limitPrice} USD` : ""}${takeProfitPrice > 0 ? `\nTake Profit: ${takeProfitPrice} USD` : ""}${stopLossPrice > 0 ? `\nStop Loss: ${stopLossPrice} USD` : ""}`
+            }],
+          };
+        } catch (error) {
+          return {
+            content: [{
+              type: "text",
+              text: `Failed to submit order: ${error instanceof Error ? error.message : String(error)}`,
+            }],
+          };
+        }
+      }
+    );
   },
   {
     capabilities: {
@@ -2958,6 +3125,9 @@ export const mcpHandler = initializeMcpApiHandler(
         },
         get_tracked_nft_transactions: {
           description: "Retrieve all tracked transactions from Magic Eden NFT Minter CLI on Monad Testnet"
+        },
+        trade_pingu_perpetuals: {
+          description: "Trade perpetuals (long/short) on Pingu protocol (Monad testnet)"
         }
       },
     },
