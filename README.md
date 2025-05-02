@@ -1,4 +1,4 @@
-# Monad Control Panel (MCP)
+# Monad HUB (MCP)
 
 The Monad Hub (MCP) is your all-in-one toolkit for interacting with the Monad testnet ecosystem. Whether you're trading tokens, minting NFTs, participating in price predictions, or analyzing blockchain data, MCP provides simple and powerful tools to help you get started.
 
