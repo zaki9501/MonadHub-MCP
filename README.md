@@ -108,11 +108,12 @@ MCP integrates with major protocols on Monad testnet:
 
 ### Trading Tools
 
-| Tool | Description | Example Usage |
-|------|-------------|---------------|
-| `get_monorail_quote` | Get swap quote | `get_monorail_quote 1.5 MON USDC` |
-| `execute_monorail_swap` | Execute swap | `execute_monorail_swap 1.5 MON USDC` |
-| `trade_nadfun_token` | Trade meme tokens | `trade_nadfun_token buy 0x123... 100` |
+| Tool                    | Description                                 | Example Usage                                         |
+|-------------------------|---------------------------------------------|-------------------------------------------------------|
+| `get_monorail_quote`    | Get swap quote                              | `get_monorail_quote 1.5 MON USDC`                     |
+| `execute_monorail_swap` | Execute swap                                | `execute_monorail_swap 1.5 MON USDC`                  |
+| `trade_nadfun_token`    | Trade meme tokens                           | `trade_nadfun_token buy 0x123... 100`                 |
+| `trade_pingu_perpetuals`| Trade perpetuals (long/short) on Pingu      | `trade_pingu_perpetuals BTC-USD long 0.5 2.5 market`  |
 
 ### NFT Tools
 
